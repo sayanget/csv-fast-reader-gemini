@@ -618,15 +618,15 @@ QESC[34] = 1;
 QESC[110] = 2;
 QESC[114] = 3;
 
-const DEF_IN_WIN = 256 * 1024;
-const DEF_OUT_WIN = 256 * 1024;
+const DEF_IN_WIN = 2560 * 1024;
+const DEF_OUT_WIN = 512 * 1024;
 const ERR_INIT = 64 * 1024;
-const PAT = Buffer.from('","header":', 'latin1');
 const hdrBuf = Buffer.allocUnsafe(16);
 
 // Output window
 let outBuf = null;
 let out8 = null;
+let outDV = null;
 let gOp = 0;
 let outFd = -1;
 let fileOffset = 0;
@@ -642,10 +642,12 @@ let errPos = 0;
 let inFd = -1;
 let inBuf = null;
 let in8 = null;
+let inDV = null;
 let winAbs = 0;
 let validLen = 0;
 let fileSize = 0;
 let scanBuf = null;
+let scan8 = null;
 
 // Set by cold helpers whenever a decision depended on the end of the available bytes.
 let gTouched = 0;
@@ -662,6 +664,7 @@ function growOut(minCap) {
   outBuf.copy(next, 0, 0, gOp);
   outBuf = next;
   out8 = new Uint8Array(outBuf.buffer, outBuf.byteOffset, outBuf.byteLength);
+  outDV = new DataView(outBuf.buffer, outBuf.byteOffset, outBuf.byteLength);
 }
 
 function writeAll(buf, len) {
@@ -721,33 +724,25 @@ function emitErrRaw(prefix, line, row, suffix, extraVal, extraStart, extraEnd) {
   let ep = errPos;
   if (ep > 0) e8[ep++] = 44;
   for (let i = 0; i < prefix.length; i++) e8[ep++] = prefix.charCodeAt(i);
-  if (line < 10) {
-    e8[ep++] = 48 + line;
-  } else {
+  {
     let k = 0, n = line;
-    while (n > 0) { const q = (n / 10) | 0; DIGITS[k++] = 48 + (n - q * 10); n = q; }
+    do { const q = (n / 10) | 0; DIGITS[k++] = 48 + (n - q * 10); n = q; } while (n > 0);
     while (k > 0) e8[ep++] = DIGITS[--k];
   }
   e8[ep++] = 44; e8[ep++] = 34; e8[ep++] = 114; e8[ep++] = 111; e8[ep++] = 119; e8[ep++] = 34; e8[ep++] = 58;
   if (row < 0) {
     e8[ep++] = 110; e8[ep++] = 117; e8[ep++] = 108; e8[ep++] = 108;
-  } else if (row < 10) {
-    e8[ep++] = 48 + row;
   } else {
     let k = 0, n = row;
-    while (n > 0) { const q = (n / 10) | 0; DIGITS[k++] = 48 + (n - q * 10); n = q; }
+    do { const q = (n / 10) | 0; DIGITS[k++] = 48 + (n - q * 10); n = q; } while (n > 0);
     while (k > 0) e8[ep++] = DIGITS[--k];
   }
   if (suffix.length > 0) {
     for (let i = 0; i < suffix.length; i++) e8[ep++] = suffix.charCodeAt(i);
     if (extraVal >= 0) {
-      if (extraVal < 10) {
-        e8[ep++] = 48 + extraVal;
-      } else {
-        let k = 0, n = extraVal;
-        while (n > 0) { const q = (n / 10) | 0; DIGITS[k++] = 48 + (n - q * 10); n = q; }
-        while (k > 0) e8[ep++] = DIGITS[--k];
-      }
+      let k = 0, n = extraVal;
+      do { const q = (n / 10) | 0; DIGITS[k++] = 48 + (n - q * 10); n = q; } while (n > 0);
+      while (k > 0) e8[ep++] = DIGITS[--k];
     } else {
       if (extraLen > 0) {
         outBuf.copy(errBuf, ep, extraStart, extraEnd);
@@ -770,140 +765,169 @@ function isCanonicalU00(b8, p, end) {
   return false;
 }
 
-// Fast-row scanner over whole rows in [p, lim): returns 0 if it stopped cleanly before `lim` (rewound to the start of
-// the unfinished row), 1 if it met a row it does not handle (rewound to that row's start).
-// Caller guarantees width > 0, rowCount >= 1, output headroom >= (lim - p) * 4 + 64, and >= 4 readable bytes past lim.
-const FAST_STATE = new Int32Array(4); // [p, op, line, rowCount]
+// Fast-row scanner over whole rows in [p, lim):
+//   returns 0 if it stopped cleanly at `lim` (rewound to the start of the unfinished row),
+//   returns 1 if it met a row needing parseOneColdRow (rewound to that row's start),
+//   returns 2 if it finished a short_row or long_row at EOL (NOT rewound; caller calls finishOddWidth).
+// Caller guarantees width > 0, rowCount >= 1, output headroom >= (lim - p) * 4 + 256, and >= 8 readable bytes past lim
+// strictly before textEnd. ZERO helper calls inside scanFastRows to avoid call-site deopts and keep TurboFan tiny.
+const FAST_STATE = new Int32Array(7); // [p, op, line, rowCount, col, cutPos, rowStartLine]
 
-function scanFastRows(b8, o8, lut, qlut, qesc, p, lim, textEnd, op, line, rowCount, width) {
+function finishOddWidth(cutPos, col, width, rowStartLine, rowCount) {
+  let op = gOp;
+  if (col < width) {
+    const pad = width - col;
+    if (op + pad * 3 + 16 > out8.length) growOut(op + pad * 3 + 64);
+    const o8 = out8;
+    const oDV = outDV;
+    o8[op++] = 34;
+    emitErrRaw('{"code":"short_row","line":', rowStartLine, rowCount, ',"fields":', col, 0, 0);
+    for (let k = 0; k < pad; k++) {
+      oDV.setInt32(op, 0x0022222c, true);
+      op += 3;
+    }
+    o8[op++] = 93;
+    gOp = op;
+    return;
+  }
+  if (op + 4 > out8.length) growOut(op + 64);
+  out8[op++] = 34;
+  emitErrRaw('{"code":"long_row","line":', rowStartLine, rowCount, ',"extra":[', -1, cutPos + 1, op);
+  out8[cutPos] = 93;
+  gOp = cutPos + 1;
+}
+
+function scanFastRows(b8, iDV, oDV, p, lim, op, line, rowCount, width) {
   let status = 0;
-  const lim2 = lim - 1;
+  let endCol = 0;
+  let endCut = -1;
+  let endRowLine = line;
 
-  rowLoop: while (p < lim2) {
-    const t0 = qlut[b8[p]];
+  rowLoop: while (p < lim) {
+    const b0 = b8[p];
     let fieldQuoted = 0;
-    if (t0) {
-      if (t0 === 1 && b8[p + 1] === 34) {
-        fieldQuoted = 1;
-      } else {
+    if (b0 === 92) {
+      if (b8[p + 1] !== 34) {
         status = 1;
         break;
       }
+      fieldQuoted = 1;
+    } else if (((b0 < 32) | (b0 === 34))) {
+      status = 1;
+      break;
     }
 
     const rowInStart = p;
     const rowStart = op;
     const rowStartLine = line;
 
-    o8[op + 2] = 34;
-    o8[op + 1] = 91;
-    o8[op] = 44;
+    oDV.setInt32(op, 0x00225b2c, true); // ,["
     op += 3;
     let col = 0;
+    let cutPos = -1;
+    let eolAdv = 0;
 
-    while (true) {
+    fieldLoop: while (true) {
       if (fieldQuoted) {
         p += 2;
-        let closed = false;
-        while (p < lim2) {
-          let tok = 0;
-          while (p < lim2) {
-            const c0 = b8[p];
-            if ((tok = qlut[c0])) { p++; break; }
-            const c1 = b8[p + 1];
-            if ((tok = qlut[c1])) { o8[op++] = c0; p += 2; break; }
-            o8[op + 1] = c1; o8[op] = c0; op += 2; p += 2;
+        let closed = 0;
+        while (p < lim) {
+          let w = 0, m = 0;
+          while (p < lim) {
+            w = iDV.getInt32(p, true);
+            oDV.setInt32(op, w, true);
+            const u = w ^ 0x02020202;
+            const t = w ^ 0x5c5c5c5c;
+            m = ((u - 0x21212121) | (t - 0x01010101)) & ~w & -0x7f7f7f80;
+            if (m) break;
+            op += 4; p += 4;
           }
-          if (!tok) break;
-          if (tok === 1) {
-            if (p >= textEnd) { p = rowInStart; op = rowStart; line = rowStartLine; status = 1; break rowLoop; }
-            const e = qesc[b8[p++]];
-            if (e === 1) {
-              if (p + 1 < textEnd && b8[p] === 92 && b8[p + 1] === 34) {
-                o8[op + 1] = 34; o8[op] = 92; op += 2; p += 2;
-              } else {
-                closed = true;
-                break;
-              }
-            } else if (e >= 2) {
-              o8[op + 1] = 110; o8[op] = 92; op += 2; line++;
-              if (e === 3 && b8[p] === 92 && b8[p + 1] === 110) p += 2;
-            } else {
-              p = rowInStart; op = rowStart; line = rowStartLine; status = 1; break rowLoop;
-            }
-          } else {
+          if (!m) break;
+          const z = m >>> 7;
+          const s = 31 - Math.clz32(z & -z);
+          const k = s >>> 3;
+          op += k;
+          p += k;
+          if (((w >>> s) & 255) !== 92) {
             p = rowInStart; op = rowStart; line = rowStartLine; status = 1; break rowLoop;
           }
+          const ew = iDV.getInt32(p, true);
+          const eb = (ew >>> 8) & 255;
+          const isQ = (eb === 34) | 0;
+          const isDoubled = (ew === 0x225c225c) | 0;
+          const isNL = ((eb === 110) | (eb === 114)) | 0;
+          const isCRLF = (ew === 0x6e5c725c) | 0;
+          if (isQ & (isDoubled ^ 1)) {
+            p += 2;
+            closed = 1;
+            break;
+          }
+          if (isDoubled | isNL) {
+            oDV.setUint16(op, isDoubled ? 0x225c : 0x6e5c, true);
+            op += 2;
+            line += isNL;
+            p += 2 + ((isDoubled | isCRLF) << 1);
+            continue;
+          }
+          p = rowInStart; op = rowStart; line = rowStartLine; status = 1; break rowLoop;
         }
         if (!closed) {
           p = rowInStart; op = rowStart; line = rowStartLine;
           break rowLoop;
         }
-        if (p >= textEnd) {
-          p = rowInStart; op = rowStart; line = rowStartLine; status = 1; break rowLoop;
-        }
-        const nt = lut[b8[p]];
-        if (nt === 1) {
+        const aw = iDV.getInt32(p, true);
+        const isCRLF = (aw === 0x6e5c725c) | 0;
+        const isLF = ((aw & 0xffff) === 0x6e5c) | 0;
+        const qAdv = 2 + (isCRLF << 1);
+        if ((aw & 255) === 44) {
           p++;
-          o8[op + 2] = 34; o8[op + 1] = 44; o8[op] = 34; op += 3;
-          if (++col === width) { p = rowInStart; op = rowStart; line = rowStartLine; status = 1; break rowLoop; }
+          const np1 = op + 1;
+          if (++col === width) cutPos = np1;
+          oDV.setInt32(op, 0x00222c22, true); // ","
+          op += 3;
           fieldQuoted = (b8[p] === 92 && b8[p + 1] === 34) ? 1 : 0;
           continue;
         }
-        if (nt === 2) {
-          const e = qesc[b8[p + 1]];
-          if (e >= 2) {
-            let adv = 2;
-            if (e === 3) {
-              if (b8[p + 2] !== 92 || b8[p + 3] !== 110) {
-                p = rowInStart; op = rowStart; line = rowStartLine; status = 1; break rowLoop;
-              }
-              adv = 4;
-            }
-            if (++col === width) {
-              p += adv;
-              line++;
-              o8[op + 1] = 93; o8[op] = 34; op += 2;
-              rowCount++;
-              continue rowLoop;
-            }
-          }
+        if (isCRLF | isLF) {
+          eolAdv = qAdv;
+          break fieldLoop;
         }
         p = rowInStart; op = rowStart; line = rowStartLine; status = 1; break rowLoop;
       }
 
-      while (p < lim2) {
-        let tok = 0;
-        while (p < lim2) {
-          const c0 = b8[p];
-          if ((tok = lut[c0])) { p++; break; }
-          const c1 = b8[p + 1];
-          if ((tok = lut[c1])) { o8[op++] = c0; p += 2; break; }
-          o8[op + 1] = c1; o8[op] = c0; op += 2; p += 2;
+      while (p < lim) {
+        let w = 0, m = 0;
+        while (p < lim) {
+          w = iDV.getInt32(p, true);
+          oDV.setInt32(op, w, true);
+          const u = w ^ 0x02020202;
+          const t1 = w ^ 0x2c2c2c2c;
+          const t2 = w ^ 0x5c5c5c5c;
+          m = ((u - 0x21212121) | (t1 - 0x01010101) | (t2 - 0x01010101)) & ~w & -0x7f7f7f80;
+          if (m) break;
+          op += 4; p += 4;
         }
-        if (!tok) {
-          p = rowInStart; op = rowStart; line = rowStartLine;
-          break rowLoop;
-        }
-        if (tok === 1) {
-          o8[op + 2] = 34; o8[op + 1] = 44; o8[op] = 34; op += 3;
-          if (++col === width) { p = rowInStart; op = rowStart; line = rowStartLine; status = 1; break rowLoop; }
+        if (!m) break;
+        const z = m >>> 7;
+        const s = 31 - Math.clz32(z & -z);
+        const k = s >>> 3;
+        op += k;
+        p += k;
+        const c = (w >>> s) & 255;
+        if (c === 44) {
+          p++;
+          const np1 = op + 1;
+          if (++col === width) cutPos = np1;
+          oDV.setInt32(op, 0x00222c22, true); // ","
+          op += 3;
           if (b8[p] === 92 && b8[p + 1] === 34) { fieldQuoted = 1; break; }
-        } else if (tok === 2) {
-          const e = qesc[b8[p++]];
-          if (e >= 2) {
-            if (e === 3) {
-              if (b8[p] !== 92 || b8[p + 1] !== 110) {
-                p = rowInStart; op = rowStart; line = rowStartLine; status = 1; break rowLoop;
-              }
-              p += 2;
-            }
-            if (++col === width) {
-              line++;
-              o8[op + 1] = 93; o8[op] = 34; op += 2;
-              rowCount++;
-              continue rowLoop;
-            }
+        } else if (c === 92) {
+          const ew = iDV.getInt32(p, true);
+          const isCRLF = (ew === 0x6e5c725c) | 0;
+          const isLF = ((ew & 0xffff) === 0x6e5c) | 0;
+          if (isCRLF | isLF) {
+            eolAdv = 2 + (isCRLF << 1);
+            break fieldLoop;
           }
           p = rowInStart; op = rowStart; line = rowStartLine; status = 1; break rowLoop;
         } else {
@@ -915,12 +939,27 @@ function scanFastRows(b8, o8, lut, qlut, qesc, p, lim, textEnd, op, line, rowCou
         break rowLoop;
       }
     }
+
+    p += eolAdv;
+    line++;
+    if (++col === width) {
+      oDV.setUint16(op, 0x5d22, true); // "]
+      op += 2;
+      rowCount++;
+      continue rowLoop;
+    }
+    endCol = col; endCut = cutPos; endRowLine = rowStartLine;
+    status = 2;
+    break rowLoop;
   }
 
   FAST_STATE[0] = p;
   FAST_STATE[1] = op;
   FAST_STATE[2] = line;
   FAST_STATE[3] = rowCount;
+  FAST_STATE[4] = endCol;
+  FAST_STATE[5] = endCut;
+  FAST_STATE[6] = endRowLine;
   return status;
 }
 
@@ -1200,6 +1239,7 @@ function refill(p) {
       inBuf.copy(next, 0, 0, validLen);
       inBuf = next;
       in8 = new Uint8Array(next.buffer, next.byteOffset, next.byteLength);
+      inDV = new DataView(next.buffer, next.byteOffset, next.byteLength);
     }
   } else {
     if (validLen > p) inBuf.copy(inBuf, 0, p, validLen);
@@ -1279,22 +1319,40 @@ function matchInputText(b8, q, len) {
   );
 }
 
+function findPat(buf, b8, from, end) {
+  let pos = from + 10;
+  while (pos < end) {
+    const j = buf.indexOf(58, pos);
+    if (j < 0 || j >= end) return -1;
+    if (b8[j - 1] === 34 && b8[j - 2] === 114 && b8[j - 3] === 101 && b8[j - 4] === 100 &&
+        b8[j - 5] === 97 && b8[j - 6] === 101 && b8[j - 7] === 104 && b8[j - 8] === 34 &&
+        b8[j - 9] === 44 && b8[j - 10] === 34) {
+      return j - 10;
+    }
+    pos = j + 1;
+  }
+  return -1;
+}
+
 // Find where the "text" string that starts at local textStart ends (first `","header":` after it; inside a JSON string
 // every '"' is escaped, so that byte run cannot occur in the text), then read the header value. Reads ahead in the
 // file through a separate small buffer; the input window is left untouched.
 function prescan(textStart) {
   let absTE = -1;
-  const idx = inBuf.indexOf(PAT, textStart);
-  if (idx >= 0 && idx + 11 <= validLen) {
+  const idx = findPat(inBuf, in8, textStart, validLen);
+  if (idx >= 0) {
     absTE = winAbs + idx;
   } else {
-    if (scanBuf === null) scanBuf = Buffer.allocUnsafe(inBuf.length);
+    if (scanBuf === null) {
+      scanBuf = Buffer.allocUnsafe(inBuf.length);
+      scan8 = new Uint8Array(scanBuf.buffer, scanBuf.byteOffset, scanBuf.byteLength);
+    }
     let pos = winAbs + (validLen - 10 > textStart ? validLen - 10 : textStart);
     while (true) {
       const n = readAt(scanBuf, 0, scanBuf.length, pos);
       if (n < 11) return false;
-      const j = scanBuf.indexOf(PAT);
-      if (j >= 0 && j + 11 <= n) { absTE = pos + j; break; }
+      const j = findPat(scanBuf, scan8, 0, n);
+      if (j >= 0) { absTE = pos + j; break; }
       if (n < scanBuf.length) return false;
       pos += n - 10;
     }
@@ -1339,7 +1397,6 @@ function transduceCaseStream(p) {
 
   putStr(header ? '{"columns":[' : '{"columns":null,"rows":[');
 
-  let fastCalls = 0;
   while (true) {
     if (inWin) {
       if (p >= te) break;
@@ -1351,26 +1408,41 @@ function transduceCaseStream(p) {
     if (gOp >= flushAt) flushOut();
 
     if (width > 0 && rowCount > 0) {
-      let safeIn = (out8.length - gOp - 128) >>> 2;
-      const cap = fastCalls < 1 ? 16384 : 98304;
-      if (safeIn > cap) safeIn = cap;
-      let lim = inWin ? te : validLen - 16;
-      let winLimited = true;
-      if (lim > p + safeIn) { lim = p + safeIn; winLimited = false; }
+      let safeIn = (out8.length - gOp - 256) >> 2;
+      if (safeIn > 16) {
+        const cap = gFastCalls < 16 ? 1024 : 262144;
+        if (safeIn > cap) safeIn = cap;
+        const availEnd = te < validLen ? te : validLen;
+        let lim = availEnd - 8;
+        let winLimited = true;
+        if (lim > p + safeIn) { lim = p + safeIn; winLimited = false; }
 
-      const prevP = p;
-      const status = scanFastRows(in8, out8, LUT, QLUT, QESC, p, lim, inWin ? te : validLen, gOp, line, rowCount, width);
-      fastCalls++;
-      p = FAST_STATE[0];
-      gOp = FAST_STATE[1];
-      line = FAST_STATE[2];
-      rowCount = FAST_STATE[3];
-      if (status === 0) {
-        if (p > prevP) continue;
-        if (winLimited && !inWin) {
-          if (!refill(p)) return -1;
-          p = 0; te = absTE - winAbs; inWin = absTE + 18 <= winAbs + validLen;
-          continue;
+        if (lim > p) {
+          const prevP = p;
+          const status = scanFastRows(in8, inDV, outDV, p, lim, gOp, line, rowCount, width);
+          gFastCalls++;
+          p = FAST_STATE[0];
+          gOp = FAST_STATE[1];
+          line = FAST_STATE[2];
+          rowCount = FAST_STATE[3];
+          if (status === 2) {
+            finishOddWidth(FAST_STATE[5], FAST_STATE[4], width, FAST_STATE[6], rowCount);
+            rowCount++;
+            continue;
+          }
+          if (status === 1 && in8[p] === 92 && p + 3 < availEnd) {
+            const b1 = in8[p + 1];
+            if (b1 === 110) { p += 2; line++; continue; }
+            if (b1 === 114 && in8[p + 2] === 92 && in8[p + 3] === 110) { p += 4; line++; continue; }
+          }
+          if (status === 0) {
+            if (p > prevP) continue;
+            if (winLimited && !inWin) {
+              if (!refill(p)) return -1;
+              p = 0; te = absTE - winAbs; inWin = absTE + 18 <= winAbs + validLen;
+              continue;
+            }
+          }
         }
       }
     }
@@ -1436,6 +1508,7 @@ function fastCase(p) {
 
 // Re-read one case whole from the file and answer it with run(); returns the absolute end of the case or -1.
 let gFallbacks = 0;
+let gFastCalls = 0;
 function fallbackCase(startAbs) {
   gFallbacks++;
   let cap = 65536;
@@ -1477,7 +1550,9 @@ function streamAll() {
     while (true) {
       if (!first) putByte(44);
       first = false;
-      if (p > 0 && validLen - p < 4096 && winAbs + validLen < fileSize) { refill(p); p = 0; }
+      if (p > 0 && winAbs + validLen < fileSize && (validLen - p < 4096 || (inBuf.length >= 1048576 && p > (inBuf.length >> 2)))) {
+        refill(p); p = 0;
+      }
       const caseStartAbs = winAbs + p;
       const outStartAbs = fileOffset + gOp;
       let np = fastCase(p);
@@ -1520,22 +1595,24 @@ function fallbackAll(inBufAll) {
 
 // Stream inPath (a cases.json array) to outPath (answers.json). inWin / outWin override the window sizes (tests only).
 function transduceFile(inPath, outPath, inWin, outWin) {
-  const iw = inWin > 0 ? inWin : DEF_IN_WIN;
-  const ow = outWin > 0 ? outWin : DEF_OUT_WIN;
   inFd = fs.openSync(inPath, 'r');
   outFd = fs.openSync(outPath, 'w');
   let ok = false;
   try {
     fileSize = fs.fstatSync(inFd).size;
+    const iw = inWin > 0 ? inWin : (fileSize + 64 < DEF_IN_WIN ? (fileSize + 64 < 65536 ? 65536 : fileSize + 64) : DEF_IN_WIN);
+    const ow = outWin > 0 ? outWin : (fileSize < 131072 ? 65536 : DEF_OUT_WIN);
     inBuf = Buffer.allocUnsafe(iw);
     in8 = new Uint8Array(inBuf.buffer, inBuf.byteOffset, inBuf.byteLength);
+    inDV = new DataView(inBuf.buffer, inBuf.byteOffset, inBuf.byteLength);
     outBuf = Buffer.allocUnsafe(ow);
     out8 = new Uint8Array(outBuf.buffer, outBuf.byteOffset, outBuf.byteLength);
+    outDV = new DataView(outBuf.buffer, outBuf.byteOffset, outBuf.byteLength);
     errBuf = Buffer.allocUnsafe(ERR_INIT);
     err8 = new Uint8Array(errBuf.buffer, errBuf.byteOffset, errBuf.byteLength);
-    flushAt = ow >> 1;
-    gOp = 0; fileOffset = 0; needTrunc = false; errPos = 0;
-    winAbs = 0; validLen = 0; scanBuf = null;
+    flushAt = ow >= 524288 ? ow - 131072 : (ow >> 1);
+    gOp = 0; fileOffset = 0; needTrunc = false; errPos = 0; gFastCalls = 0;
+    winAbs = 0; validLen = 0; scanBuf = null; scan8 = null;
     fillWin();
     ok = streamAll();
     if (ok && needTrunc) fs.ftruncateSync(outFd, fileOffset);
@@ -1544,7 +1621,7 @@ function transduceFile(inPath, outPath, inWin, outWin) {
   }
   fs.closeSync(inFd);
   fs.closeSync(outFd);
-  inBuf = in8 = outBuf = out8 = errBuf = err8 = scanBuf = null;
+  inBuf = in8 = inDV = outBuf = out8 = outDV = errBuf = err8 = scanBuf = scan8 = null;
   if (!ok) fs.writeFileSync(outPath, fallbackAll(fs.readFileSync(inPath)));
 }
 
